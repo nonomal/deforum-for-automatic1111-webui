@@ -1,8 +1,20 @@
+# Copyright (C) 2023 Deforum LLC
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# Contact the authors: https://deforum.github.io/
+
 import torch
-import gc
-from PIL import Image
-from modules import devices
-from zoedepth.utils.misc import colorize 
 from zoedepth.models.builder import build_model
 from zoedepth.utils.config import get_config
 
@@ -21,21 +33,14 @@ class ZoeDepth:
         self.zoe.core.prep.resizer._Resize__height = self.height
         depth_tensor = self.zoe.infer_pil(image, output_type="tensor")
         return depth_tensor
-
+        
+    def to(self, device):
+        self.DEVICE = device
+        self.zoe = self.model_zoe.to(device)
+        
     def save_raw_depth(self, depth, filepath):
         depth.save(filepath, format='PNG', mode='I;16')
-
-    def colorize_depth(self, depth):
-        colored = colorize(depth)
-        return colored
-
-    def save_colored_depth(self, depth, filepath):
-        colored = colorize(depth)
-        Image.fromarray(colored).save(filepath)
     
     def delete(self):
         del self.model_zoe
         del self.zoe
-        gc.collect()
-        torch.cuda.empty_cache()
-        devices.torch_gc()

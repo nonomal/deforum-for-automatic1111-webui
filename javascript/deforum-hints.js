@@ -1,3 +1,21 @@
+/*
+# Copyright (C) 2023 Deforum LLC
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+Contact the authors: https://deforum.github.io/
+*/
+
 // mouseover tooltips for various UI elements
 
 deforum_titles = {
@@ -17,16 +35,12 @@ deforum_titles = {
     "Resize seed from width": "Normally, changing the resolution will completely change an image, even when using the same seed. If you generated an image with a particular seed and then changed the resolution, put the original resolution here to get an image that more closely resemles the original",
     "Resize seed from height": "Normally, changing the resolution will completely change an image, even when using the same seed. If you generated an image with a particular seed and then changed the resolution, put the original resolution here to get an image that more closely resemles the original",
     "Steps": "How many times to improve the generated image iteratively; higher values take longer; very low values can produce bad results",
-    //"ddim_eta": "";
-    //"n_batch": "",
-    //"save_settings": "",
-    //"save_samples": "",
     "Batch name": "output images will be placed in a folder with this name ({timestring} token will be replaced) inside the img2img output folder. Supports placeholders like {seed}, {w}, {h}, {prompts} and more",
 	"Pix2Pix img CFG schedule": "*Only in use with pix2pix checkpoints!*",
     "Filename format": "specify the format of the filename for output images",
     "Seed behavior": "defines the seed behavior that is used for animations",
         "iter": "the seed value will increment by 1 for each subsequent frame of the animation",
-        "fixed": "the seed will remain fixed across all frames of animation",
+        "fixed": "the seed will remain fixed across all frames of animation. **NOT RECOMMENDED.** Unless you know what you are doing, it will *deep fry* the pictures over time",
         "random": "a random seed will be used on each frame of the animation",
 		"schedule": "specify your own seed schedule",
 	"Seed iter N":"controls for how many frames the same seed should stick before iterating to the next one",
@@ -69,6 +83,7 @@ deforum_titles = {
         "HSV": "HSV is a good method for balancing presence of vibrant colors, but may produce unrealistic results - (ie.blue apples)",
         "LAB": "LAB is a more linear approach to mimic human perception of color space - a good default setting for most users.",
         "RGB": "RGB is good for enforcing unbiased amounts of color in each red, green and blue channel - some images may yield colorized artifacts if sampling is too low.",
+        "Legacy colormatch": "applies the colormatch only before the video noising, resulting in graying the video over time, use it for backwards compatibility",
     "Cadence": "A setting of 1 will cause every frame to receive diffusion in the sequence of image outputs. A setting of 2 will only diffuse on every other frame, yet motion will still be in effect. The output of images during the cadence sequence will be automatically blended, additively and saved to the specified drive. This may improve the illusion of coherence in some workflows as the content and context of an image will not change or diffuse during frames that were skipped. Higher values of 4-8 cadence will skip over a larger amount of frames and only diffuse the “Nth” frame as set by the diffusion_cadence value. This may produce more continuity in an animation, at the cost of little opportunity to add more diffused content. In extreme examples, motion within a frame will fail to produce diverse prompt context, and the space will be filled with lines or approximations of content - resulting in unexpected animation patterns and artifacts. Video Input & Interpolation modes are not affected by diffusion_cadence.",
     "Optical flow cadence": "Optional method for optical flow used to blend frames during cadence in 3D animation mode (if cadence more than 1).",
     "Optical flow redo generation": "This option takes twice as long because it generates twice in order to capture the optical flow from the previous image to the first generation, then warps the previous image and redoes the generation. Works in 2D/3D animation modes.",
@@ -137,7 +152,6 @@ deforum_titles = {
     "Use manual settings": "when this is unchecked, the video will automatically be created in the same output folder as the images. Check this box to specify different settings for the creation of the video, specified by the following options",
     "Render steps": "render each step of diffusion as a separate frame",
     "Max video frames": "the maximum number of frames to include in the video, when use_manual_settings is checked",
-    //"path_name_modifier": "",
     "Image path": "the location of images to create the video from, when use_manual_settings is checked",
     "MP4 path": "the output location of the mp4 file, when use_manual_settings is checked",
 	"Delete Imgs": "if enabled, raw imgs will be deleted after a successful video/ videos (upsacling, interpolation, gif) creation",

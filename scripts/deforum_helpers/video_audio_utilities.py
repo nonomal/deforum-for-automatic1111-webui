@@ -1,3 +1,19 @@
+# Copyright (C) 2023 Deforum LLC
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# Contact the authors: https://deforum.github.io/
+
 import os
 import cv2
 import shutil
@@ -5,23 +21,58 @@ import math
 import requests
 import subprocess
 import time
+import tempfile
 import re 
 import glob
 import concurrent.futures
+from pathlib import Path
 from pkg_resources import resource_filename
 from modules.shared import state, opts
-from .general_utils import checksum, duplicate_pngs_from_folder
-from basicsr.utils.download_util import load_file_from_url
+from .general_utils import checksum, clean_gradio_path_strings, debug_print
 from .rich import console
+import shutil
+from threading import Thread
+try:
+  from modules.modelloader import load_file_from_url
+except:
+  print("Try to fallback to basicsr with older modules")
+  from basicsr.utils.download_util import load_file_from_url
 
-# DEBUG_MODE = opts.data.get("deforum_debug_mode_enabled", False)
- 
+def convert_image(input_path, output_path):
+    # Read the input image
+    img = cv2.imread(input_path)
+    # Get the file extension of the output path
+    out_ext = os.path.splitext(output_path)[1].lower()
+    # Convert the image to the specified output format
+    if out_ext == ".png":
+        cv2.imwrite(output_path, img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+    elif out_ext == ".jpg" or out_ext == ".jpeg":
+        cv2.imwrite(output_path, img, [cv2.IMWRITE_JPEG_QUALITY, 99])
+    elif out_ext == ".bmp":
+        cv2.imwrite(output_path, img)
+    else:
+        print(f"Unsupported output format: {out_ext}")
+
 def get_ffmpeg_params(): # get ffmpeg params from webui's settings -> deforum tab. actual opts are set in deforum.py
     f_location = opts.data.get("deforum_ffmpeg_location", find_ffmpeg_binary())
     f_crf = opts.data.get("deforum_ffmpeg_crf", 17)
     f_preset = opts.data.get("deforum_ffmpeg_preset", 'slow')
 
     return [f_location, f_crf, f_preset]
+
+def get_ffmpeg_paths(outdir, timestring, anim_args, video_args, output_suffix=''):
+    image_path = os.path.join(outdir, f"{timestring}_%09d.png")
+    mp4_path = os.path.join(outdir, f"{timestring}{output_suffix}.mp4")
+    
+    real_audio_track = None
+    if video_args.add_soundtrack != 'None':
+        real_audio_track = anim_args.video_init_path if video_args.add_soundtrack == 'Init Video' else video_args.soundtrack_path
+
+    srt_path = None
+    if opts.data.get("deforum_save_gen_info_as_srt", False) and opts.data.get("deforum_embed_srt", False):
+        srt_path = os.path.join(outdir, f"{timestring}.srt")
+        
+    return [image_path, mp4_path, real_audio_track, srt_path]
 
 # e.g gets 'x2' returns just 2 as int
 def extract_number(string):
@@ -37,10 +88,14 @@ def vid2frames(video_path, video_in_frame_path, n=1, overwrite=True, extract_fro
 
     if n < 1: n = 1 #HACK Gradio interface does not currently allow min/max in gr.Number(...) 
 
+    video_path = clean_gradio_path_strings(video_path)
     # check vid path using a function and only enter if we get True
     if is_vid_path_valid(video_path):
 
         name = get_frame_name(video_path)
+
+        if not (video_path.startswith('http://') or video_path.startswith('https://')):
+            video_path = os.path.realpath(video_path)
 
         vidcap = cv2.VideoCapture(video_path)
         video_fps = vidcap.get(cv2.CAP_PROP_FPS)
@@ -75,7 +130,7 @@ def vid2frames(video_path, video_in_frame_path, n=1, overwrite=True, extract_fro
             vidcap.set(cv2.CAP_PROP_POS_FRAMES, extract_from_frame) # Set the starting frame
             success,image = vidcap.read()
             count = extract_from_frame
-            t=1
+            t=0
             success = True
             max_workers = int(max(1, (os.cpu_count() / 2) - 1)) # set max threads to cpu cores halved, minus 1. minimum is 1
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -90,8 +145,8 @@ def vid2frames(video_path, video_in_frame_path, n=1, overwrite=True, extract_fro
                         file_path = os.path.join(video_in_frame_path, file_name)
                         executor.submit(save_frame, image, file_path)
                         t += 1
-                    success,image = vidcap.read()
                     count += 1
+                    success, image = vidcap.read()
             print(f"Extracted {count} frames from video in {time.time() - start_time:.2f} seconds!")
         else:
             print("Frames already unpacked")
@@ -106,19 +161,27 @@ def is_vid_path_valid(video_path):
     # vid path is actually a URL, check it 
     if video_path.startswith('http://') or video_path.startswith('https://'):
         response = requests.head(video_path, allow_redirects=True)
+        extension = extension.rsplit('?', 1)[0] # remove query string before checking file format extension.
+        content_disposition = response.headers.get('Content-Disposition')
+        if content_disposition and extension not in file_formats:
+            # Filename doesn't look valid, but perhaps the content disposition will say otherwise?
+            match = re.search(r'filename="?(?P<filename>[^"]+)"?', content_disposition)
+            if match:
+                extension = match.group('filename').rsplit('.', 1)[-1].lower()
         if response.status_code == 404:
-            raise ConnectionError("Video URL is not valid. Response status code: {}".format(response.status_code))
+            raise ConnectionError(f"Video URL {video_path} is not valid. Response status code: {response.status_code}")
         elif response.status_code == 302:
             response = requests.head(response.headers['location'], allow_redirects=True)
         if response.status_code != 200:
-            raise ConnectionError("Video URL is not valid. Response status code: {}".format(response.status_code))
+            raise ConnectionError(f"Video URL {video_path} is not valid. Response status code: {response.status_code}")
         if extension not in file_formats:
-            raise ValueError("Video file format '{}' not supported. Supported formats are: {}".format(extension, file_formats))
+            raise ValueError(f"Video file {video_path} has format '{extension}', which is not supported. Supported formats are: {file_formats}")
     else:
+        video_path = os.path.realpath(video_path)
         if not os.path.exists(video_path):
-            raise RuntimeError("Video path does not exist.")
+            raise RuntimeError(f"Video path does not exist: {video_path}")
         if extension not in file_formats:
-            raise ValueError("Video file format '{}' not supported. Supported formats are: {}".format(extension, file_formats))
+            raise ValueError(f"Video file {video_path} has format '{extension}', which is not supported. Supported formats are: {file_formats}")
     return True
 
 # quick-retreive frame count, FPS and H/W dimensions of a video (local or URL-based)
@@ -135,7 +198,7 @@ def get_quick_vid_info(vid_path):
     return video_fps, video_frame_count, (video_width, video_height)
     
 # Stitch images to a h264 mp4 video using ffmpeg
-def ffmpeg_stitch_video(ffmpeg_location=None, fps=None, outmp4_path=None, stitch_from_frame=0, stitch_to_frame=None, imgs_path=None, add_soundtrack=None, audio_path=None, crf=17, preset='veryslow'):
+def ffmpeg_stitch_video(ffmpeg_location=None, fps=None, outmp4_path=None, stitch_from_frame=0, stitch_to_frame=None, imgs_path=None, add_soundtrack=None, audio_path=None, crf=17, preset='veryslow', srt_path=None):
     start_time = time.time()
 
     print(f"Got a request to stitch frames to video using FFmpeg.\nFrames:\n{imgs_path}\nTo Video:\n{outmp4_path}")
@@ -147,7 +210,6 @@ def ffmpeg_stitch_video(ffmpeg_location=None, fps=None, outmp4_path=None, stitch
         cmd = [
             ffmpeg_location,
             '-y',
-            '-vcodec', 'png',
             '-r', str(float(fps)),
             '-start_number', str(stitch_from_frame),
             '-i', imgs_path,
@@ -158,10 +220,13 @@ def ffmpeg_stitch_video(ffmpeg_location=None, fps=None, outmp4_path=None, stitch
             '-pix_fmt', 'yuv420p',
             '-crf', str(crf),
             '-preset', preset,
-            '-pattern_type', 'sequence',
-            outmp4_path
+            '-pattern_type', 'sequence'
         ]
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cmd.append('-vcodec')
+        cmd.append('png' if imgs_path[0].find('.png') != -1 else 'libx264')
+        cmd.append(outmp4_path)
+
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         stdout, stderr = process.communicate()
     except FileNotFoundError:
         print("\r" + " " * len(msg_to_print), end="", flush=True)
@@ -172,9 +237,27 @@ def ffmpeg_stitch_video(ffmpeg_location=None, fps=None, outmp4_path=None, stitch
         print(f"\r{msg_to_print}", flush=True)
         raise Exception(f'Error stitching frames to video. Actual runtime error:{e}')
     
+    add_soundtrack_status = None
+    add_soundtrack_success = None
+    temp_file = None
     if add_soundtrack != 'None':
-        audio_add_start_time = time.time()
         try:
+            audio_path = clean_gradio_path_strings(audio_path)
+            if (audio_path.startswith('http://') or audio_path.startswith('https://')):
+                url = audio_path
+                print(f"Downloading audio file from: {url}")
+                response = requests.get(url, stream=True)
+                response.raise_for_status()
+                temp_file = tempfile.NamedTemporaryFile(delete=False)
+                # Write the content of the downloaded file into the temporary file
+                with open(temp_file.name, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:  # filter out keep-alive new chunks
+                            f.write(chunk)
+                audio_path = temp_file.name
+                print(f"Audio saved to: {audio_path}")
+
+            audio_add_start_time = time.time()            
             cmd = [
                 ffmpeg_location,
                 '-i',
@@ -187,25 +270,59 @@ def ffmpeg_stitch_video(ffmpeg_location=None, fps=None, outmp4_path=None, stitch
                 '-shortest',
                 outmp4_path+'.temp.mp4'
             ]
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             stdout, stderr = process.communicate()
             if process.returncode != 0:
-                print("\r" + " " * len(msg_to_print), end="", flush=True)
-                print(f"\r{msg_to_print}", flush=True)
                 raise RuntimeError(stderr)
             os.replace(outmp4_path+'.temp.mp4', outmp4_path)
-            print("\r" + " " * len(msg_to_print), end="", flush=True)
-            print(f"\r{msg_to_print}", flush=True)
-            print(f"\rFFmpeg Video+Audio stitching \033[0;32mdone\033[0m in {time.time() - start_time:.2f} seconds!", flush=True)
+            add_soundtrack_status = f"\rFFmpeg audio embedding \033[0;32mdone\033[0m in {time.time() - audio_add_start_time:.2f} seconds!"
+            add_soundtrack_success = True
         except Exception as e:
-            print("\r" + " " * len(msg_to_print), end="", flush=True)
-            print(f"\r{msg_to_print}", flush=True)
-            print(f'\rError adding audio to video. Actual error: {e}', flush=True)
-            print(f"FFMPEG Video (sorry, no audio) stitching \033[33mdone\033[0m in {time.time() - start_time:.2f} seconds!", flush=True)
-    else:
-        print("\r" + " " * len(msg_to_print), end="", flush=True)
-        print(f"\r{msg_to_print}", flush=True)
-        print(f"\rVideo stitching \033[0;32mdone\033[0m in {time.time() - start_time:.2f} seconds!", flush=True)
+            add_soundtrack_status = f"\rError adding audio to video: {e}"
+            add_soundtrack_success = False
+        finally:
+            if temp_file:
+                file_path = Path(temp_file.name)
+                file_path.unlink(missing_ok=True)
+            
+    add_srt = opts.data.get("deforum_save_gen_info_as_srt", False) and opts.data.get("deforum_embed_srt", False) and srt_path is not None
+    add_srt_status = None
+    add_srt_success = None
+    if add_srt:
+        try:
+            srt_add_start_time = time.time()
+            cmd = [
+                ffmpeg_location,
+                '-i', outmp4_path,
+                '-i', srt_path,
+                '-c', 'copy',
+                '-c:s', 'mov_text',
+                '-metadata:s:s:0', 'title=Deforum Data',
+                outmp4_path+'.temp.mp4'
+            ]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                raise RuntimeError(stderr)
+            os.replace(outmp4_path+'.temp.mp4', outmp4_path)
+            add_srt_status = f"\rFFmpeg subtitle embedding \033[0;32mdone\033[0m in {time.time() - srt_add_start_time:.2f} seconds!"
+            add_srt_success = True
+        except Exception as e:
+            add_srt_status = f"\rError adding subtitles to video: {e}"
+            add_srt_success = False
+
+    print("\r" + " " * len(msg_to_print), end="", flush=True)
+    print(f"\r{msg_to_print}", flush=True)
+
+    status_summary = f"\rVideo stitching \033[0;32mdone\033[0m in {time.time() - start_time:.2f} seconds!"
+    if add_soundtrack_status:
+        print(add_soundtrack_status, flush=True)
+        status_summary += " Audio embedded successfully." if add_soundtrack_success else " Sorry, no audio - see above for errors."
+    if add_srt_status:
+        print(add_srt_status, flush=True)
+        status_summary += " Subtitles embedded successfully." if add_srt_success else " Sorry, no subtitles - see above for errors."
+
+    print(status_summary, flush=True)
 
 def get_frame_name(path):
     name = os.path.basename(path)
@@ -215,7 +332,7 @@ def get_frame_name(path):
 def get_next_frame(outdir, video_path, frame_idx, mask=False):
     frame_path = 'inputframes'
     if (mask): frame_path = 'maskframes'
-    return os.path.join(outdir, frame_path, get_frame_name(video_path) + f"{frame_idx+1:09}.jpg")
+    return os.path.join(outdir, frame_path, get_frame_name(video_path) + f"{frame_idx:09}.jpg")
      
 def find_ffmpeg_binary():
     try:
@@ -286,7 +403,7 @@ def check_and_download_gifski(models_folder, current_user_os):
     file_path = os.path.join(models_folder, file_name)
     
     if not os.path.exists(file_path):
-        load_file_from_url(download_url, models_folder)
+        load_file_from_url(url=download_url, model_dir=models_folder)
         if current_user_os in ['Linux','Mac']:
             os.chmod(file_path, 0o755)
             if current_user_os == 'Mac':
@@ -341,12 +458,76 @@ def handle_imgs_deletion(vid_path=None, imgs_folder_path=None, batch_id=None):
             print("Did not delete imgs as there was a mismatch between # of frames in folder, and # of frames in actual video. Please check and delete manually. ")
     except Exception as e:
         print(f"Error deleting raw images. Please delete them manually if you want. Actual error:\n{e}")
-    
+
+# handle deletion of inputframes created by video frame extraction
+def handle_input_frames_deletion(imgs_folder_path=None):
+    try:
+        total_imgs_to_delete = count_matching_frames(imgs_folder_path, None)
+        if total_imgs_to_delete is None or total_imgs_to_delete == 0:
+            return
+        print("Deleting input frames, as requested:")
+        total_imgs_deleted = delete_input_frames(imgs_folder_path)
+        print(f"Deleted {total_imgs_deleted} out of {total_imgs_to_delete} inputframes!")
+        os.rmdir(imgs_folder_path)
+    except Exception as e:
+        print(f"Error deleting input frames. Please delete them manually if you want. Actual error:\n{e}")
+
+def handle_cn_frames_deletion(cn_input_frames_list):
+    try:
+        for cn_inputframes_folder in cn_input_frames_list:
+            if os.path.exists(cn_inputframes_folder):
+                total_cn_imgs_to_delete = count_matching_frames(cn_inputframes_folder, None)
+                if total_cn_imgs_to_delete is None or total_cn_imgs_to_delete == 0:
+                    continue
+                total_imgs_deleted = delete_input_frames(cn_inputframes_folder)
+                print(f"Deleted {total_imgs_deleted} CN inputframes out of {total_cn_imgs_to_delete}!")
+                os.rmdir(cn_inputframes_folder)
+    except Exception as e:
+        print(f"Error deleting CN input frames. Please delete them manually if you want. Actual error:\n{e}")
+
 def delete_matching_frames(from_folder, img_batch_id):
     return sum(1 for f in os.listdir(from_folder) if get_matching_frame(f, img_batch_id) and os.remove(os.path.join(from_folder, f)) is None)
+
+# delete inputframes
+def delete_input_frames(from_folder):
+    return sum(1 for f in os.listdir(from_folder) if os.remove(os.path.join(from_folder, f)) is None)
     
 def count_matching_frames(from_folder, img_batch_id):
+    if str(from_folder).endswith("inputframes"):
+        return sum(1 for f in os.listdir(from_folder))
     return sum(1 for f in os.listdir(from_folder) if get_matching_frame(f, img_batch_id))
 
 def get_matching_frame(f, img_batch_id=None):
     return ('png' in f or 'jpg' in f) and '-' not in f and '_depth_' not in f and ((img_batch_id is not None and f.startswith(img_batch_id) or img_batch_id is None))
+
+def render_preview(args, anim_args, video_args, root, frame_idx, last_preview_frame):
+    is_preview_on = "on" in opts.data.get("deforum_preview", "off").lower()
+    preview_interval_frames = opts.data.get("deforum_preview_interval_frames", 50)
+    is_preview_frame = (frame_idx % preview_interval_frames) == 0 or (frame_idx - last_preview_frame) >= preview_interval_frames
+    is_close_to_end = frame_idx >= (anim_args.max_frames-1)
+
+    debug_print(f"render preview video: frame_idx={frame_idx} preview_interval_frames={preview_interval_frames} anim_args.max_frames={anim_args.max_frames} is_preview_on={is_preview_on} is_preview_frame={is_preview_frame} is_close_to_end={is_close_to_end} ")
+
+    if not is_preview_on or not is_preview_frame or is_close_to_end:
+        debug_print(f"No preview video on frame {frame_idx}.")
+        return last_preview_frame
+    
+    f_location, f_crf, f_preset = get_ffmpeg_params() # get params for ffmpeg exec
+    image_path, mp4_temp_path, real_audio_track, srt_path = get_ffmpeg_paths(args.outdir, root.timestring, anim_args, video_args, "_preview__rendering__")
+    mp4_preview_path = mp4_temp_path.replace("_preview__rendering__", "_preview")
+    def task():
+        if os.path.exists(mp4_temp_path):
+            print(f"--! Skipping preview video on frame {frame_idx} (previous preview still rendering to {mp4_temp_path}...")            
+        else:
+            print(f"--> Rendering preview video up to frame {frame_idx} to {mp4_preview_path}...")
+            try:
+                ffmpeg_stitch_video(ffmpeg_location=f_location, fps=video_args.fps, outmp4_path=mp4_temp_path, stitch_from_frame=0, stitch_to_frame=frame_idx, imgs_path=image_path, add_soundtrack=video_args.add_soundtrack, audio_path=real_audio_track, crf=f_crf, preset=f_preset, srt_path=srt_path)
+            finally:
+                shutil.move(mp4_temp_path, mp4_preview_path)
+        
+    if "concurrent" in opts.data.get("deforum_preview", "off").lower():
+        Thread(target=task).start()
+    else:
+        task()
+
+    return frame_idx
